@@ -43,6 +43,18 @@ REGISTER_OP("SetFilter")
     .Attr("variant_type: string")
     .Output("output: bool");
 
+REGISTER_OP("FeatureValueFilter")
+    .Input("input: variant")
+    .Attr("field_name: string")
+    .Attr("op: string")
+    .Attr("float_operand: list(float)")
+    .Attr("int_operand: list(int)")
+    .Attr("string_operand: list(string)")
+    .Attr("operand_filepath: string")
+    .Attr("field_type: string")
+    .Attr("keep_empty: bool = false")
+    .Output("output: bool");
+
 REGISTER_OP("ValueFilter")
     .Input("input: variant")
     .Attr("field_name: string")
@@ -82,6 +94,15 @@ REGISTER_OP("AddLabel")
       return Status::OK();
     });
 
+REGISTER_OP("MonolithTFExampleToExample")
+    .Input("input: string")
+    .Attr("feature_description: string")
+    .Output("output: variant")
+    .SetShapeFn([](shape_inference::InferenceContext *ctx) {
+      ctx->set_output(0, ctx->input(0));
+      return Status::OK();
+    });
+
 REGISTER_OP("ScatterLabel")
     .Input("input: variant")
     .Attr("config: string")
@@ -115,6 +136,9 @@ REGISTER_OP("NegativeSample")
     .Attr("label_index: int = 0")
     .Attr("threshold: float = 0.0")
     .Attr("variant_type: string")
+    .Attr("priorities: list(int)")
+    .Attr("actions: list(int)")
+    .Attr("per_action_drop_rate: list(float)")
     .Output("output: bool");
 
 REGISTER_OP("LabelUpperBound")
@@ -154,6 +178,19 @@ REGISTER_OP("SwitchSlot")
       }
       ctx->set_output(rank, ctx->input(rank));
 
+      return Status::OK();
+    });
+
+REGISTER_OP("SwitchSlotBatch")
+    .Input("pb_input: variant")
+    .Output("pb_output: variant")
+    .Attr("features: list(string)")
+    .Attr("slots: list(int)")
+    .Attr("inplaces: list(bool)")
+    .Attr("suffix: string")
+    .Attr("variant_type: string")
+    .SetShapeFn([](shape_inference::InferenceContext *ctx) {
+      ctx->set_output(0, ctx->input(0));
       return Status::OK();
     });
 
@@ -367,4 +404,26 @@ REGISTER_OP("KafkaGroupReadableNextV2")
       c->set_output(1, c->Scalar());
       return Status::OK();
     });
+
+REGISTER_OP("MonolithGenFidMask")
+    .Input("splits: T")
+    .Input("values: int64")
+    .Output("mask: float32")
+    .Attr("fid: int")
+    .Attr("T: {int32, int64}")
+    .SetShapeFn([](shape_inference::InferenceContext *ctx) {
+      shape_inference::ShapeHandle shape = ctx->input(0);
+      if (ctx->Rank(shape) == 1) {
+        shape_inference::DimensionHandle new_dim;
+        TF_RETURN_IF_ERROR(ctx->Subtract(ctx->Dim(shape, 0), 1, &new_dim));
+        shape_inference::ShapeHandle out_shape;
+        TF_RETURN_IF_ERROR(ctx->ReplaceDim(shape, 0, new_dim, &out_shape));
+        ctx->set_output(0, out_shape);
+      } else {
+        ctx->set_output(0, ctx->MakeShape({ctx->UnknownDim()}));
+      }
+
+      return Status::OK();
+    });
+
 }  // namespace tensorflow

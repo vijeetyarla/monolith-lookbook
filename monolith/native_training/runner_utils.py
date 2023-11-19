@@ -36,7 +36,7 @@ from monolith.native_training import gflags_utils
 from monolith.native_training.monolith_checkpoint_state_pb2 import MonolithCheckpointState
 from monolith.native_training.net_utils import AddressFamily
 from monolith.native_training import save_utils
-from monolith.native_training.mlp_utils import mlp_pass, add_mpi_exception_hook, MLPEnv, kill_by_port
+from monolith.native_training.mlp_utils import mlp_pass, add_mpi_exception_hook, MLPEnv
 
 FLAGS = flags.FLAGS
 old_isabs = os.path.isabs
@@ -229,7 +229,7 @@ class RunnerConfig(DistributedCpuTrainingConfig):
   end_hour: int = None
   enable_dynamic_sharding: bool = False
   max_task_num_per_worker: int = 1
-  disable_native_metrics: bool = False
+  disable_native_metrics: bool = True
 
   def __post_init__(self):
     mlp_pass()
@@ -238,6 +238,10 @@ class RunnerConfig(DistributedCpuTrainingConfig):
       gflags_utils.update(self)
     except:
       logging.info("update RunnerConfig failed")
+
+    if self.enable_gpu_training and self.enable_partial_sync_training:
+      if (self.index <= 0 or self.index is None) and self.server_type == 'worker':
+        self.index = int(os.environ.get('OMPI_COMM_WORLD_RANK') or '0')
 
     if self.kafka_topics:
       if isinstance(self.kafka_topics, str):
@@ -383,9 +387,6 @@ def monolith_discovery(runner_conf: RunnerConfig):
 
       logging.info('enter monolith_discovery!')
       yield discovery
-      mlp_env = MLPEnv()
-      if mlp_env.avaiable:
-        kill_by_port(mlp_env.ssh_port)
   except Exception as e:
     raise e
   finally:

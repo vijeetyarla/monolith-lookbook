@@ -12,9 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from enum import Enum
 import string
 import numpy as np
-from typing import Any, List, Union, Dict
+from typing import Any, List, Union, Dict, Tuple
 
 import tensorflow as tf
 
@@ -22,8 +23,9 @@ from monolith.utils import get_libops_path
 from monolith.native_training.monolith_export import monolith_export
 from monolith.native_training.runtime.ops import gen_monolith_ops
 from idl.matrix.proto.line_id_pb2 import LineId
-from monolith.native_training.data.data_op_config_pb2 import LabelConf, \
-  TaskLabelConf
+from monolith.native_training.data.feature_list import add_feature, add_feature_by_fids
+from monolith.native_training.data.data_op_config_pb2 import (
+    LabelConf, TaskLabelConf, TFRecordFeatureDescription)
 
 ragged_data_ops = gen_monolith_ops
 
@@ -65,10 +67,100 @@ def filter_by_fids(variant: tf.Tensor,
   ]
   select_slots = [] if select_slots is None else select_slots
   assert all([slot > 0 for slot in select_slots])
+  if variant_type != 'instance':
+    add_feature_by_fids(filter_fids)
+    add_feature_by_fids(has_fids)
+    add_feature_by_fids(select_fids)
 
   return ragged_data_ops.set_filter(variant, filter_fids, has_fids, select_fids,
                                     has_actions or [], req_time_min,
                                     select_slots, variant_type)
+
+
+@monolith_export
+def filter_by_feature_value(variant: tf.Tensor,
+                            field_name: str,
+                            op: str,
+                            operand: Union[float, int, str, List[float],
+                                           List[int], List[str]],
+                            field_type: str,
+                            keep_empty: bool = False,
+                            operand_filepath: str = None):
+  """通过值过滤, 连续特征过滤, 
+  
+  Args:
+    variant (:obj:`Tensor`): 输入数据, 必须是variant类型
+    field_name (:obj:`List[int]`): 当field_name, 样本被过滤
+    op (:obj:`str`): 比较运算符, 可以是 gt/ge/eq/lt/le/neq/between/in/not-in 等
+      布尔运算，也可以是 all/any/diff 等集合布尔运算
+    operand (:obj:`float`): 操作数, 用于比较, 可以为值或者List
+    keep_empty (:obj:`bool`): False
+    field_type (:obj:`str`): 需要显式指定字段类型, 可以为int64/float/double/bytes
+
+  Returns:
+    variant tensor, 过滤后的数据, variant类型
+  """
+
+  assert op in {
+      'gt', 'ge', 'eq', 'lt', 'le', 'neq', 'between', 'in', 'not-in', 'all',
+      'any', 'diff', 'startswith', 'endswith'
+  }
+
+  assert (operand is None and operand_filepath) or (operand is not None and
+                                                    not operand_filepath)
+  assert field_type in {
+      'int64', 'float', 'double', 'bytes'
+  }, 'You must specify field_type for feature value_filter!'
+
+  string_operand = []
+  operand_filepath = '' if operand_filepath is None else operand_filepath
+
+  if operand_filepath:
+    assert op in {'in', 'not-in'}
+    assert (isinstance(operand_filepath, str) and
+            tf.io.gfile.exists(operand_filepath))
+    int_operand, float_operand = [], []
+  elif op in {'all', 'any', 'diff'}:
+    assert field_type == 'int64', 'all/any/diff op only support int64 list'
+    if not isinstance(operand, (list, tuple)):
+      assert isinstance(operand, int)
+      int_operand, float_operand = [operand], []
+    else:
+      assert all(isinstance(o, int) for o in operand)
+      int_operand, float_operand = list(operand), []
+  elif field_type in {'float', 'double'}:
+    if op == 'between':
+      assert all(isinstance(o, (int, float)) for o in operand)
+      int_operand, float_operand = [], [float(o) for o in operand]
+    else:
+      int_operand, float_operand = [], [float(operand)]
+  elif field_type == 'int64':
+    if op in {'in', 'not-in', 'between'}:
+      assert all(isinstance(o, int) for o in operand)
+      int_operand, float_operand = list(operand), []
+    else:
+      int_operand, float_operand = [int(operand)], []
+  elif field_type == 'bytes':
+    int_operand, float_operand = [], []
+    if isinstance(operand, str):
+      string_operand.append(operand)
+    elif isinstance(operand, (list, tuple)):
+      assert all(isinstance(o, str) for o in operand)
+      string_operand.extend(operand)
+    else:
+      raise RuntimeError("params error!")
+  else:
+    raise RuntimeError("params error!")
+
+  return ragged_data_ops.feature_value_filter(variant,
+                                              field_name=field_name,
+                                              op=op,
+                                              float_operand=float_operand,
+                                              int_operand=int_operand,
+                                              string_operand=string_operand,
+                                              operand_filepath=operand_filepath,
+                                              field_type=field_type,
+                                              keep_empty=keep_empty)
 
 
 @monolith_export
@@ -84,9 +176,10 @@ def filter_by_value(variant: tf.Tensor,
   
   Args:
     variant (:obj:`Tensor`): 输入数据, 必须是variant类型
-    field_name (:obj:`List[int]`): 任意一个FID出现`filter_fids`中, 样本被过滤
+    field_name (:obj:`List[int]`): 需要执行过滤逻辑的字段名
     op (:obj:`str`): 比较运算符, 可以是 gt/ge/eq/lt/le/neq/between/in/not-in 等
-      布尔运算，也可以是 all/any/diff 等集合布尔运算
+      布尔运算，也可以是 all/any/diff 等集合布尔运算，也可以是 startswith/endswith 等
+      字符串判断逻辑
     operand (:obj:`float`): 操作数, 用于比较
     variant_type (:obj:`str`): variant类型, 可以为instance/example
     keep_empty (:obj:`bool`): False
@@ -94,6 +187,9 @@ def filter_by_value(variant: tf.Tensor,
   Returns:
     variant tensor, 过滤后的数据, variant类型
   """
+
+  if variant_type != 'instance':
+    add_feature('__LINE_ID__')
 
   assert op in {
       'gt', 'ge', 'eq', 'lt', 'le', 'neq', 'between', 'in', 'not-in', 'all',
@@ -184,6 +280,9 @@ def add_action(
     variant tensor, 改写后的数据，variant 类型
   """
 
+  if variant_type != 'instance':
+    add_feature('__LINE_ID__')
+
   assert op in {'gt', 'ge', 'eq', 'lt', 'le', 'neq', 'between', 'in'}
   assert variant_type in {'instance', 'example'}
   fields = LineId.DESCRIPTOR.fields_by_name
@@ -263,6 +362,8 @@ def add_label(
   """
 
   assert variant_type in {'instance', 'example'}
+  if variant_type != 'instance':
+    add_feature('__LINE_ID__')
   assert config, 'Please specify config and retry!'
   assert 0 < new_sample_rate <= 1.0, 'new_sample_rate should be in (0, 1.0]'
 
@@ -318,6 +419,9 @@ def scatter_label(
   """
 
   assert variant_type in {'instance', 'example'}
+  if variant_type != 'instance':
+    add_feature('__LABEL__')
+    add_feature('__LINE_ID__')
   assert config, 'Please specify config and retry!'
 
   return ragged_data_ops.scatter_label(variant,
@@ -350,6 +454,8 @@ def filter_by_label(
   """
 
   assert variant_type in {'instance', 'example'}
+  if variant_type != 'instance':
+    add_feature('__LABEL__')
   assert len(label_threshold) > 0, 'Please specify label_threshold and retry!'
 
   return ragged_data_ops.filter_by_label(variant,
@@ -377,6 +483,10 @@ def special_strategy(variant: tf.Tensor,
   Returns:
     variant tensor, 过滤后的数据, variant类型
   """
+
+  if variant_type != 'instance':
+    add_feature('__LABEL__')
+    add_feature('__LINE_ID__')
 
   items = [] if strategy_conf is None else strategy_conf.strip().split(',')
   special_strategies, sample_rates, labels = [], [], []
@@ -409,7 +519,9 @@ def negative_sample(variant: tf.Tensor,
                     drop_rate: float,
                     label_index: int = 0,
                     threshold: float = 0.0,
-                    variant_type: str = 'instance'):
+                    variant_type: str = 'instance',
+                    action_priority: str = None,
+                    per_action_drop_rate: str = None):
   """负例采样
   
   Args:
@@ -418,16 +530,36 @@ def negative_sample(variant: tf.Tensor,
     label_index (:obj:`int`): 样本中labels是一个列表, label_index表示本次启用哪一个index对应的label
     threshold (:obj:`float`): label是一个实数, 大于`threshold`的是正样本
     variant_type (:obj:`str`): variant类型, 可以为instance/example
+    action_priority (:obj:`str`): action的优先级列表, action用int表示, 以逗号分隔, 排在前面的优先级高
+    per_action_drop_rate (:obj:`str`): 基本单元是`action:drop_rate`, 可以用逗号分隔多个基本单元
   
   Returns:
     variant tensor, 过滤后的数据, variant类型
   """
 
+  if variant_type != 'instance':
+    add_feature('__LABEL__')
+
+  assert action_priority is None or isinstance(action_priority, str)
+  assert per_action_drop_rate is None or isinstance(per_action_drop_rate, str)
+  priority = []
+  actions, action_drop_rate = [], []
+
+  if action_priority and per_action_drop_rate:
+    priority = [int(i) for i in action_priority.strip().split(",")]
+    for item in per_action_drop_rate.strip().split(","):
+      action, dr = item.strip().split(":")
+      actions.append(int(action))
+      action_drop_rate.append(float(dr))
+
   return ragged_data_ops.negative_sample(variant,
                                          drop_rate=drop_rate,
                                          label_index=label_index,
                                          threshold=threshold,
-                                         variant_type=variant_type)
+                                         variant_type=variant_type,
+                                         priorities=priority,
+                                         actions=actions,
+                                         per_action_drop_rate=action_drop_rate)
 
 
 @monolith_export
@@ -494,6 +626,38 @@ def switch_slot(ragged: tf.RaggedTensor, slot: int) -> tf.RaggedTensor:
                                            validate=False)
   else:
     return ragged.with_flat_values(values)
+
+
+@monolith_export
+def switch_slot_batch(variant: tf.Tensor,
+                      features: Dict[str, Tuple[bool, int]],
+                      variant_type: str = 'example_batch',
+                      suffix: str = 'share') -> tf.Tensor:
+  """对Sparse特征批量切换slot
+
+  Args:
+    variant (:obj:`VariantTensor`): 输入特征, 目前只支持pb格式
+    features (:obj:`dict`): 特征配置, 特征名 -> (是否原地修改, 新slot)
+    variant_type (:obj:`str`): 输入variant的类型, 目前支持'example', 'example_batch'这两种
+
+  Returns:
+    Variant Tensor, 切换后的特征
+
+  """
+  feats, slots, inplaces = [], [], []
+  for name, (inplace, slot) in features.items():
+    feats.append(name)
+    inplaces.append(inplace)
+    slots.append(slot)
+
+  assert variant_type in {'example', 'example_batch'}
+  output = ragged_data_ops.switch_slot_batch(variant,
+                                             features=feats,
+                                             slots=slots,
+                                             inplaces=inplaces,
+                                             suffix=suffix,
+                                             variant_type=variant_type)
+  return output
 
 
 @monolith_export
@@ -635,6 +799,8 @@ def fill_multi_rank_output(
   """When use_rank_multi_output flag is set.
   """
   assert variant_type in {'instance', 'example'}
+  if variant_type != 'instance':
+    add_feature('__LINE_ID__')
 
   return ragged_data_ops.fill_multi_rank_output(
       input=variant,
@@ -760,6 +926,8 @@ dataset = dataset.flat_map(lambda v: tf.data.Dataset.from_tensors(
         datasources=self._datasources,
         default_datasource=self._default_datasource)))
 '''
+
+
 def string_to_variant_with_transform(tensor: tf.Tensor,
                                      input_type: str = 'example',
                                      output_type: str = 'example',
@@ -822,13 +990,81 @@ def kafka_read_next(input, index: int, message_poll_timeout: int,
       message_poll_timeout=message_poll_timeout,
       stream_timeout=stream_timeout)
 
+
 def kafka_read_next_v2(input, index: int, message_poll_timeout: int,
-                    stream_timeout: int):
+                       stream_timeout: int):
   return ragged_data_ops.KafkaGroupReadableNextV2(
       input=input,
       index=index,
       message_poll_timeout=message_poll_timeout,
       stream_timeout=stream_timeout)
 
+
 def has_variant(input, variant_type: str = 'example'):
   return ragged_data_ops.HasVariant(input=input, variant_type=variant_type)
+
+
+def gen_fid_mask(tenosr: tf.RaggedTensor, fid: int) -> tf.Tensor:
+  fid = np.uint64(fid).astype(np.int64)
+  return ragged_data_ops.monolith_gen_fid_mask(tenosr.row_splits,
+                                               tenosr.flat_values,
+                                               fid=fid)
+
+
+@monolith_export
+def tf_example_to_example(serialized: tf.Tensor,
+                          sparse_features: Dict[str, int],
+                          dense_features: List[str],
+                          label: str,
+                          instance_weight: str = None):
+  """ 将序列化的 tf.example 转换为 Monolith Example，在转换的同时，指定的 sparse_features
+      会被抽取成 FID
+  Args:
+    serialized (:obj:`Tensor`): tf.example 的序列化数据，string 类型
+    sparse_features (:obj:`Dict[str, int]`): sparse feature name 到 slot id 的映射，
+      举例：sparse_features = {"user_id": 1, "item_id": 2, "posterior_ctr": 3}，
+        1. "user_id" 原始类型为 int64，它将被抽取成 FID，存入 Monolith Example 的 fid_v2_list，对应 slot_id=1
+        2. "item_id" 原始类型为 int64，它将被抽取成 FID，存入 Monolith Example 的 fid_v2_list，对应 slot_id=2
+        3. "posterior_ctr" 原始类型为 float32，它将被抽取成 FID，存入 Monolith Example 的 fid_v2_list，对应 slot_id=3
+    dense_features (:obj:`List[str]`): 指定的这些字段将直接 Copy 到 Monolith Example 中
+    label (:obj:`str`): 存储在 tf.example 中的哪个字段是 label
+    instance_weight (:obj:`str`): 存储在 tf.example 中的哪个字段是 instance_weight
+
+  Returns:
+    variant tensor: Monolith Example 格式的 variant tensor
+  """
+
+  ## default value setting
+  sparse_features = sparse_features or []
+  dense_features = dense_features or []
+  label = label or ""
+  instance_weight = instance_weight or ""
+
+  ## validity check
+  intersection = set(sparse_features.keys()) & set(dense_features)
+  assert len(
+      intersection
+  ) == 0, f"{intersection} occur in sparse_features and dense_features simultaneously, please investigate and retry!"
+  assert label not in sparse_features, f"label: {label} should NOT occur in sparse_features, please investigate and retry!"
+  assert label not in dense_features, f"label: {label} should NOT occur in dense_features, please investigate and retry!"
+  assert instance_weight not in sparse_features, f"instance_weight: {instance_weight} should NOT occur in sparse_features, please investigate and retry!"
+  assert instance_weight not in dense_features, f"instance_weight: {instance_weight} should NOT occur in dense_features, please investigate and retry!"
+
+  slot_ids = list(sparse_features.values())
+  duplicates = {slot for slot in slot_ids if slot_ids.count(slot) > 1}
+  assert len(
+      duplicates
+  ) == 0, f"{duplicates} have multiple sparse feature name mapping, please investigate and retry!"
+  for slot_id in slot_ids:
+    assert 0 < slot_id < 32768, "slot_id should be in [1, 32768)"
+
+  ## generate feature_description proto
+  feature_description = TFRecordFeatureDescription()
+  for k, v in sparse_features.items():
+    feature_description.sparse_features[k] = v
+  feature_description.dense_features.extend(dense_features)
+  feature_description.label = label
+  feature_description.instance_weight = instance_weight
+  return ragged_data_ops.MonolithTFExampleToExample(
+      input=serialized,
+      feature_description=feature_description.SerializeToString())

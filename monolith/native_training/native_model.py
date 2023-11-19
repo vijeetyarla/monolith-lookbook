@@ -43,18 +43,19 @@ from monolith.native_training import hash_table_ops
 from monolith.native_training.native_task_context import get
 import monolith.native_training.feature_utils as feature_utils
 from monolith.native_training.estimator import EstimatorSpec
-from monolith.native_training.embedding_combiners import FirstN
+from monolith.native_training.embedding_combiners import FirstN, Combiner
 from monolith.native_training.graph_utils import add_batch_norm_into_update_ops
 from monolith.native_training.layers import LogitCorrection
 from monolith.native_training.native_task import NativeTask, NativeContext
 from monolith.native_training.metric import utils as metric_utils
 from monolith.native_training.model_export import export_context
 from monolith.native_training.model_export.export_context import is_exporting, is_exporting_distributed
-from monolith.native_training.data.feature_list import FeatureList, get_feature_name_and_slot
+from monolith.native_training.data.feature_list import get_feature_name_and_slot
 from monolith.native_training.monolith_export import monolith_export
 from monolith.native_training.runtime.hash_table import \
     embedding_hash_table_pb2
-from monolith.native_training.data.utils import get_slot_feature_name, enable_to_env
+from monolith.native_training.data.feature_utils import switch_slot, switch_slot_batch
+from monolith.native_training.data.utils import get_slot_feature_name, enable_tob_env, register_slots
 from monolith.native_training.utils import add_to_collections
 from monolith.native_training.model_dump.dump_utils import DumpUtils
 from monolith.native_training.dense_reload_utils import CustomRestoreListener, CustomRestoreListenerKey
@@ -242,7 +243,7 @@ class MonolithBaseModel(NativeTask, ABC):
 
   def __init__(self, params):
     super(MonolithBaseModel, self).__init__(params)
-    enable_to_env()
+    enable_tob_env()
     self.fs_dict = {}
     self.fc_dict = {}
     # feature_name -> slice_name -> FeatureSlice(feature_slot, start, end)
@@ -250,6 +251,7 @@ class MonolithBaseModel(NativeTask, ABC):
     self._layout_dict = {}
     self._occurrence_threshold = {}
     self._use_dense_allreduce = FLAGS.enable_sync_training
+    self._share_slot_mapping = {}
 
   def __getattr__(self, name):
     if "p" in self.__dict__:
@@ -306,6 +308,13 @@ class MonolithBaseModel(NativeTask, ABC):
     else:
       op_fields.append(pred)
     fmt = self.p.delimiter.join(["{}"] * len(op_fields)) + "\n"
+    try:
+      op_fields_tmp = [
+        tf.squeeze(tensor, axis=-1) if tensor.shape.rank > 1 and tensor.shape.as_list()[-1] == 1 else tensor
+        for tensor in op_fields if tensor is not None]
+      op_fields = op_fields_tmp
+    except Exception as e:
+      pass
     result = tf.nest.map_structure(
       tf.stop_gradient,
       tf.map_fn(fn=lambda t: tf.strings.format(fmt, t, summarize=-1),
@@ -571,13 +580,18 @@ class MonolithBaseModel(NativeTask, ABC):
             if head_classification:
               auc_per_core, auc_update_op = tf.compat.v1.metrics.auc(
                   labels=label_tensor, predictions=pred_tensor, name=name)
-              tf.compat.v1.summary.scalar("{}_auc".format(name), auc_per_core)
+              auc_head_name = "{}_auc".format(name)
+              print_op = tf.print(auc_head_name, auc_per_core, output_stream=sys.stderr)
+              with tf.control_dependencies([print_op]):
+                tf.compat.v1.summary.scalar(auc_head_name, tf.identity(auc_per_core))
               train_ops.append(auc_update_op)
             else:
               mean_squared_error, mse_update_op = tf.compat.v1.metrics.mean_squared_error(
                   labels=label_tensor, predictions=pred_tensor, name=name)
-              tf.compat.v1.summary.scalar("{}_mse".format(name),
-                                          mean_squared_error)
+              mse_head_name = "{}_mse".format(name)
+              print_op = tf.print(mse_head_name, mean_squared_error, output_stream=sys.stderr)
+              with tf.control_dependencies([print_op]):
+                tf.compat.v1.summary.scalar(mse_head_name, tf.identity(mean_squared_error))
               train_ops.append(mse_update_op)
       else:
         targets.append(head_name)
@@ -588,13 +602,18 @@ class MonolithBaseModel(NativeTask, ABC):
           if is_classification:
             auc_per_core, auc_update_op = tf.compat.v1.metrics.auc(
                 labels=label, predictions=pred, name=head_name)
-            tf.compat.v1.summary.scalar(f"{head_name}_auc", auc_per_core)
+            auc_head_name = "{}_auc".format(head_name)
+            print_op = tf.print(auc_head_name, auc_per_core, output_stream=sys.stderr)
+            with tf.control_dependencies([print_op]):
+              tf.compat.v1.summary.scalar(auc_head_name, tf.identity(auc_per_core))
             train_ops.append(auc_update_op)
           else:
             mean_squared_error, mse_update_op = tf.compat.v1.metrics.mean_squared_error(
                 labels=label, predictions=pred, name=head_name)
-            tf.compat.v1.summary.scalar("{}_mse".format(head_name),
-                                        mean_squared_error)
+            mse_head_name = "{}_mse".format(head_name)
+            print_op = tf.print(mse_head_name, mean_squared_error, output_stream=sys.stderr)
+            with tf.control_dependencies([print_op]):
+              tf.compat.v1.summary.scalar(mse_head_name, tf.identity(mean_squared_error))
             train_ops.append(mse_update_op)
 
       enable_metrics = self.metrics.enable_kafka_metrics or self.metrics.enable_file_metrics or self.metrics.enable_deep_insight
@@ -799,12 +818,9 @@ class MonolithBaseModel(NativeTask, ABC):
     else:
       out_conf = OutConfig(out_type=OutType.NONE)
 
-    for slice_conf in slice_list:
+    for feature_name, slice_conf in slice_list:
       slice_config = out_conf.slice_configs.add()
-      if len(slice_conf.feature_slot.get_feature_columns()) > 1:
-        raise Exception(
-            "There are multi feature columns on a slot, not support yet!")
-      slice_config.feature_name = slice_conf.feature_slot.name
+      slice_config.feature_name = feature_name
       slice_config.start = slice_conf.start
       slice_config.end = slice_conf.end
 
@@ -871,7 +887,8 @@ class MonolithModel(MonolithBaseModel):
       fc = self.fc_dict[fc]
 
     feature_slot = fc.feature_slot
-    feature_name = fc.feature_name
+    feature_name = self._share_slot_mapping.get(
+      fc.feature_name, fc.feature_name)
 
     if feature_name in self.slice_dict:
       if slice_name in self.slice_dict[feature_name]:
@@ -887,7 +904,7 @@ class MonolithModel(MonolithBaseModel):
                                                 learning_rate_fn)
       self.slice_dict[feature_name] = {slice_name: fc_slice}
 
-    slice_list.append(fc_slice)
+    slice_list.append((fc.feature_name, fc_slice))
     return fc.embedding_lookup(fc_slice)
 
   @dump_utils.record_feature
@@ -896,7 +913,8 @@ class MonolithModel(MonolithBaseModel):
                                       occurrence_threshold: int = None,
                                       expire_time: int = 36500,
                                       max_seq_length: int = 0,
-                                      shared_name: str = None) -> FeatureColumn:
+                                      shared_name: str = None,
+                                      combiner: str = None) -> FeatureColumn:
     """创建嵌入特征列(embedding feature column)
 
     Args:
@@ -911,20 +929,28 @@ class MonolithModel(MonolithBaseModel):
 
     """
 
+    if combiner and isinstance(combiner, str):
+      assert combiner in {'reduce_sum', 'reduce_mean', 'first_n'}
+      if combiner == 'reduce_sum':
+        combiner = FeatureColumn.reduce_sum()
+      elif combiner == 'reduce_mean':
+        combiner = FeatureColumn.reduce_mean()
+      else:
+        combiner = FeatureColumn.first_n()
     feature_name, slot = get_feature_name_and_slot(feature_name)
 
     if feature_name in self.fc_dict:
       return self.fc_dict[feature_name]
     else:
       if shared_name is not None and len(shared_name) > 0:
+        self._share_slot_mapping[feature_name] = shared_name
         if shared_name in self.fs_dict:
           fs = self.fs_dict[shared_name]
         elif shared_name in self.fc_dict:
           fs = self.fc_dict[shared_name].feature_slot
         else:
           try:
-            feature_list = FeatureList.parse()
-            shared_slot = feature_list[shared_name].slot
+            shared_name, shared_slot = get_feature_name_and_slot(shared_name)
             shared_fs = self.ctx.create_feature_slot(
                 self._get_fs_conf(shared_name, shared_slot,
                                   occurrence_threshold, expire_time))
@@ -938,10 +964,11 @@ class MonolithModel(MonolithBaseModel):
         fs = self.ctx.create_feature_slot(
             self._get_fs_conf(feature_name, slot, occurrence_threshold,
                               expire_time))
-      if max_seq_length > 0:
-        combiner = FeatureColumn.first_n(max_seq_length)
-      else:
-        combiner = FeatureColumn.reduce_sum()
+      if combiner is None:
+        if max_seq_length > 0:
+          combiner = FeatureColumn.first_n(max_seq_length)
+        else:
+          combiner = FeatureColumn.reduce_sum()
       fc = FeatureColumn(fs, feature_name, combiner=combiner)
       self.fc_dict[feature_name] = fc
       return fc
@@ -1056,4 +1083,27 @@ class MonolithModel(MonolithBaseModel):
         self.add_layout(layout_name, slice_list, 'addn', shape_list=[out.shape])
         return out
 
+  def share_slot(self,
+                 features: Union[tf.Tensor, Dict[str, tf.RaggedTensor]] = None,
+                 share_meta: Dict[str, Tuple[bool, int]] = None,
+                 variant_type: str = 'example',
+                 suffix: str = 'share'):
+    for name, (inplace, slot) in share_meta.items():
+      shared_name = f'{name}_{suffix}'
+      if not inplace:
+        register_slots({shared_name: slot})
+      else:
+        register_slots({name: slot})
+
+    if features is not None and isinstance(features, dict):
+      for name, (inplace, slot) in share_meta.items():
+        if inplace:
+          features[name] = switch_slot(features[name], slot)
+        else:
+          features[shared_name] = switch_slot(features[name], slot)
+      return features
+    else:
+      map_fn = lambda tensor: switch_slot_batch(tensor, share_meta, 
+        variant_type=variant_type, suffix=suffix)
+      return map_fn
 

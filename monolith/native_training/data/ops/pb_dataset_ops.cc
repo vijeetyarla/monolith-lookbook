@@ -93,6 +93,7 @@ REGISTER_OP("InstanceNegativeGenDataset")
     .Attr("throw_origin: bool")
     .Attr("throw_origin_neg: bool")
     .Attr("cache_only_pos: bool")
+    .Attr("cache_negative_actions: list(int)")
     .Attr("real_neg_instance_weight: float")
     .Attr("sampled_neg_instance_weight: float")
     .Attr("unbias_sampled_neg: bool")
@@ -147,6 +148,18 @@ REGISTER_OP("DynamicMatchingFilesDataset")
 REGISTER_OP("MonolithCacheOneDataset")
     .Input("input: variant")
     .Output("handle: variant")
+    .SetShapeFn([](shape_inference::InferenceContext* c) {
+      shape_inference::ShapeHandle unused;
+      TF_RETURN_IF_ERROR(c->WithRankAtMost(c->input(0), 0, &unused));
+      return shape_inference::ScalarShape(c);
+    });
+
+REGISTER_OP("TransformDataset")
+    .Input("input: variant")
+    .Attr("config: string")
+    .Attr("variant_type: string")
+    .Output("handle: variant")
+    .SetDoNotOptimize()  // Source dataset ops must disable constant folding.
     .SetShapeFn([](shape_inference::InferenceContext* c) {
       shape_inference::ShapeHandle unused;
       TF_RETURN_IF_ERROR(c->WithRankAtMost(c->input(0), 0, &unused));

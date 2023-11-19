@@ -23,7 +23,7 @@ from typing import Any, Tuple, Callable
 from queue import Queue, Empty
 from threading import Thread, RLock
 
-from absl import logging
+from absl import logging, flags
 from datetime import datetime
 from tensorflow.python.profiler.internal import _pywrap_traceme
 from tensorflow.python.training import basic_session_run_hooks
@@ -36,6 +36,9 @@ from monolith.native_training.metric import cli
 from monolith.native_training import utils
 from monolith.native_training.metric.kafka_utils import KProducer
 from monolith.native_training.metric.exit_hook import exit_hook
+
+
+FLAGS = flags.FLAGS
 
 
 class ThroughputMetricHook(tf.estimator.SessionRunHook):
@@ -142,103 +145,59 @@ class Tf2ProfilerHook(tf.estimator.SessionRunHook):
 
   def __init__(self,
                logdir: str,
+               init_step_range: Tuple[int, int],
                save_steps: int = None,
                save_secs: int = None,
                options: tf.profiler.experimental.ProfilerOptions = None):
     """Only one of save_steps and save_secs should be provided."""
     self._logdir = logdir
     self._options = options
+    self._start_step, self._end_step = init_step_range
+    if self._start_step is not None and (self._end_step is None or self._end_step <= self._start_step):
+      raise ValueError("End step invalid, start_step: {}, end_step: {}".format(self._start_step, self._end_step))
+    self._default_delta = 10
+    self._delta = self._end_step - self._start_step if self._end_step is not None else self._default_delta
+    if save_steps is not None and save_steps <= self._delta:
+      raise ValueError("Save steps must be greater than delta steps(default: {})".format(self._default_delta))
     self._timer = tf.estimator.SecondOrStepTimer(every_steps=save_steps,
                                                  every_secs=save_secs)
-    self._global_step_tensor = tf.compat.v1.train.get_global_step()
     self._current_step = 0
+    self._trace_me = None
 
     self._profiling = False
 
   def begin(self):
-    self._start_profiling()
+    try:
+      # if enable_sync_training, there is no tf.distribute.Server
+      # we need start profiler server
+      if FLAGS.enable_sync_training:
+        tf.profiler.experimental.server.start(6666)
+    except:
+      logging.warning("cannot start profiler server at 6666")
 
   def before_run(self, run_context):
-    del run_context
     # fix step-time graph, related issue: https://github.com/tensorflow/profiler/issues/282
     # TODO(huangruiteng): remove this after updating tensorflow
     if self._profiling:
       self._trace_me = _pywrap_traceme.TraceMe("TraceContext", graph_type="train", step_num=self._current_step)
-    return tf.estimator.SessionRunArgs(self._global_step_tensor)
+    return tf.estimator.SessionRunArgs(fetches=None)
 
   def after_run(self, run_context, run_values: tf.estimator.SessionRunValues):
-    del run_context
-    self._current_step = run_values.results
+    self._current_step += 1
     if self._profiling:
       self._trace_me.Stop()
-    if self._timer.should_trigger_for_step(self._current_step):
-      self._stop_profiling()
-      self._timer.update_last_triggered_step(self._current_step)
-      self._start_profiling()
-
-  def end(self, sess):
-    del sess
-    self._stop_profiling()
-
-  def _start_profiling(self):
-    try:
-      tf.profiler.experimental.start(self._logdir, self._options)
-      self._profiling = True
-    except tf.errors.AlreadyExistsError:
-      # User profiles by themselves. OK to ignore here.
-      pass
-
-  def _stop_profiling(self):
-    try:
-      if self._profiling:
-        self._profiling = False
-        tf.profiler.experimental.stop()
-    except tf.errors.UnavailableError:
-      # Maybe user terminates profiling, ignore here.
-      pass
-
-
-class Tf2ProfilerCaptureOnceHook(tf.estimator.SessionRunHook):
-  """Using TF2 profiler in esitmator to capture only once."""
-
-  def __init__(self,
-               logdir: str,
-               capture_step_range: Tuple[int, int],
-               options: tf.profiler.experimental.ProfilerOptions = None):
-    """Capture the profiler between (start, end) step of capture_step_range."""
-    self._logdir = logdir
-    self._start_step, self._end_step = capture_step_range
-    self._options = options
-    self._current_step = 0
-
-    self._profiling = False
-
-  def begin(self):
-    self._global_step_tensor = training_util._get_or_create_global_step_read()
-    if self._global_step_tensor is None:
-      raise RuntimeError(
-          "Global step should be created to use Tf2ProfilerCaptureOnceHook.")
-
-  def before_run(self, run_context):
-    # fix step-time graph, related issue: https://github.com/tensorflow/profiler/issues/282
-    # TODO(huangruiteng): remove this after updating tensorflow
-    if self._profiling:
-      self._trace_me = _pywrap_traceme.TraceMe("TraceContext", graph_type="train", step_num=self._current_step)
-    return tf.estimator.SessionRunArgs(self._global_step_tensor)
-
-  def after_run(self, run_context, run_values: tf.estimator.SessionRunValues):
-    self._current_step = run_values.results
     if self._start_step is None:
-      self._start_step = self._current_step + 10
-      self._end_step = self._start_step + 10
-      
-    if self._profiling:
-      self._trace_me.Stop()
-
-    if not self._profiling and self._current_step >= self._start_step - 1 and self._current_step < self._end_step - 1:
-      self._start_profiling()
-    if self._profiling and self._current_step >= self._end_step - 1:
+      self._start_step = self._current_step + 500
+      self._end_step = self._start_step + self._default_delta
+    if self._current_step < self._start_step:
+      return
+    if self._current_step >= self._end_step:
       self._stop_profiling()
+    if self._timer.should_trigger_for_step(self._current_step):
+      self._start_profiling()
+      self._timer.update_last_triggered_step(self._current_step)
+      self._start_step = self._current_step
+      self._end_step = self._start_step + self._delta
 
   def end(self, sess):
     if self._profiling:
@@ -249,8 +208,11 @@ class Tf2ProfilerCaptureOnceHook(tf.estimator.SessionRunHook):
       tf.profiler.experimental.start(self._logdir, self._options)
       self._profiling = True
     except tf.errors.AlreadyExistsError:
-      # User profiles by themselves. OK to ignore here.
-      pass
+      # Two cases:
+      # 1. User profiles by themselves.
+      # 2. When profiling by save_secs, it's still profiling after save_secs.
+      # OK to ignore here.
+      self._profiling = True
 
   def _stop_profiling(self):
     try:
@@ -258,8 +220,8 @@ class Tf2ProfilerCaptureOnceHook(tf.estimator.SessionRunHook):
         self._profiling = False
         tf.profiler.experimental.stop()
     except tf.errors.UnavailableError:
-      # Maybe user terminates profiling, ignore here.
-      pass
+      # Maybe user terminates profiling
+      self._profiling = False
 
 
 class ByteCCLTelemetryHook(tf.estimator.SessionRunHook):
@@ -307,10 +269,14 @@ class ByteCCLTelemetryHook(tf.estimator.SessionRunHook):
         logging.info(f'Communication telemetry: {samples} ...')
 
 
-class NVProfilerCaptureOnceHook(Tf2ProfilerCaptureOnceHook):
+class NVProfilerHook(Tf2ProfilerHook):
 
-  def __init__(self, capture_step_range: Tuple[int, int]):
-    super().__init__(None, capture_step_range)
+  def __init__(self,
+               init_step_range: Tuple[int, int],
+               save_steps: int = None,
+               save_secs: int = None,
+               options: tf.profiler.experimental.ProfilerOptions = None):
+    super().__init__(None, init_step_range, save_steps, save_secs)
     import ctypes
     self._libcudart = ctypes.cdll.LoadLibrary("libcudart.so")  # linux
 

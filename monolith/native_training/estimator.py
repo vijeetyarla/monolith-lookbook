@@ -132,6 +132,7 @@ class RunConfig:
     enable_alias_map_auto_gen: 是否需要自动生成 alias_map
     save_summary_steps: 每隔多少global_step保存一次summary
     log_step_count_steps: 每隔多少global_step打印一次loss
+    disable_native_metrics: 是否关闭 TensorFlow 的 metrics 功能，如 AUC、MSE 的计算，默认为 True
   """
 
   # basic
@@ -181,6 +182,8 @@ class RunConfig:
   kafka_group_id: str = None
   kafka_servers: str = None
 
+  disable_native_metrics: bool = True
+
   save_summary_steps: int = 100
   log_step_count_steps: int = 100
 
@@ -197,7 +200,8 @@ class RunConfig:
         kafka_group_id=self.kafka_group_id,
         kafka_servers=self.kafka_servers,
         save_summary_steps=self.save_summary_steps,
-        log_step_count_steps=self.log_step_count_steps)
+        log_step_count_steps=self.log_step_count_steps,
+        disable_native_metrics=self.disable_native_metrics)
     for name, _ in get_type_hints(RunConfig).items():
       value = getattr(self, name)
       if hasattr(conf, name) and value is not None:
@@ -400,7 +404,9 @@ class Estimator(object):
   def latest_checkpoint(self):
     return self._est.latest_checkpoint()
 
-  def train(self, steps=None, max_steps=None):
+  def train(self, steps=None, max_steps=None, hooks=None):
+    assert hooks is None or isinstance(hooks, list) and \
+      all(isinstance(o, tf.estimator.SessionRunHook) for o in hooks)
     set_metric_prefix("monolith.training.{}".format(
         self._runner_conf.deep_insight_name))
     model = copy.deepcopy(self._model)
@@ -423,7 +429,8 @@ class Estimator(object):
                                         self._runner_conf,
                                         model_dir=model_dir,
                                         steps=steps,
-                                        profiling=self._enable_loacl_profiling)
+                                        profiling=self._enable_loacl_profiling,
+                                        user_hooks=hooks)
       DumpUtils().dump(f'{self._runner_conf.model_dir}/model_dump')
     else:
       DumpUtils().enable = False
@@ -439,7 +446,8 @@ class Estimator(object):
         init_sync_train_and_update_conf(self._runner_conf)
         self.__est = distributed_sync_train(self._runner_conf,
                                             params=model,
-                                            sync_backend=self._sync_backend)
+                                            sync_backend=self._sync_backend,
+                                            user_hooks=hooks)
       else:
         with monolith_discovery(self._runner_conf) as discovery:
           if self._runner_conf.enable_gpu_training:
@@ -452,10 +460,13 @@ class Estimator(object):
           self.__est = distributed_train(config=self._runner_conf,
                                          discovery=discovery,
                                          params=model,
-                                         sync_backend=self._sync_backend)
+                                         sync_backend=self._sync_backend,
+                                         user_hooks=hooks)
     self.close()
 
-  def evaluate(self, steps=None):
+  def evaluate(self, steps=None, hooks=None):
+    assert hooks is None or isinstance(hooks, list) and \
+      all(isinstance(o, tf.estimator.SessionRunHook) for o in hooks)
     model = copy.deepcopy(self._model)
     model.mode = tf.estimator.ModeKeys.EVAL
     if not isinstance(model, InstantiableParams):
@@ -474,7 +485,8 @@ class Estimator(object):
                                         self._runner_conf,
                                         model_dir=model_dir,
                                         steps=steps,
-                                        profiling=self._enable_loacl_profiling)
+                                        profiling=self._enable_loacl_profiling,
+                                        user_hooks=hooks)
       DumpUtils().dump(f'{self._runner_conf.model_dir}/model_dump')
     else:
       DumpUtils().enable = False
@@ -486,7 +498,8 @@ class Estimator(object):
         init_sync_train_and_update_conf(self._runner_conf)
         self.__est = distributed_sync_train(self._runner_conf,
                                             params=model,
-                                            sync_backend=self._sync_backend)
+                                            sync_backend=self._sync_backend,
+                                            user_hooks=hooks)
       else:
         with monolith_discovery(self._runner_conf) as discovery:
           if self._runner_conf.enable_gpu_training:

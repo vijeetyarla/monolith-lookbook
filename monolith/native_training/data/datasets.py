@@ -48,8 +48,9 @@ from monolith.utils import get_libops_path
 from monolith.native_training.monolith_export import monolith_export
 from monolith.native_training.data.feature_utils import create_item_pool, string_to_variant, \
   has_variant, kafka_resource_init, kafka_read_next, kafka_read_next_v2, string_to_variant_with_transform
-from monolith.native_training.data.feature_list import FeatureList
+from monolith.native_training.data.feature_list import FeatureList, add_feature
 from monolith.native_training.data.parsers import get_default_parser_ctx
+from monolith.native_training.data.transform.transforms import Transform
 from monolith.native_training import native_task_context
 from monolith.native_training.distribute import distributed_dataset
 from monolith.native_training.runtime.ops import gen_monolith_ops
@@ -77,11 +78,14 @@ flags.DEFINE_string('dataset_input_compression_type', None,
                     'string, dataset_input_compression_type')
 flags.DEFINE_bool('dataset_input_use_parquet', None,
                   'bool dataset_input_use_parquet')
+flags.DEFINE_bool('dataset_input_use_tfrecord', None,
+                  'bool dataset_input_use_tfrecord')
 flags.DEFINE_integer('dataset_worker_idx', None, 'int dataset_worker_idx')
 flags.DEFINE_integer('dataset_num_workers', None, 'int dataset_num_workers')
 flags.DEFINE_string('kafka_other_metadata', None,
                     'string, kafka_other_metadata')
 POOL_KEY = "TF_ITEMPOOL"
+OUTPUT_PB_TYPE_GRAPH_KEY = "monolith_dataset_output_pb_type"
 
 
 class FeaturePruningType(object):
@@ -122,6 +126,8 @@ def _get_params(name, default=None):
 class DatasetMetaclass(type):
 
   def __call__(cls, *args, **kwargs):
+    logging.info('---args: %s', args)
+    logging.info('---kwargs: %s', kwargs)
     if kwargs.get('topics_or_files', None):
       value = kwargs['topics_or_files']
       if isinstance(value, str):
@@ -219,42 +225,71 @@ class DatasetMetaclass(type):
 
     if FLAGS.dataset_input_use_parquet is not None:
       kwargs['use_parquet'] = FLAGS.dataset_input_use_parquet
+    if FLAGS.dataset_input_use_tfrecord is not None:
+      kwargs['use_tfrecord'] = FLAGS.dataset_input_use_tfrecord
+    assert not (
+        FLAGS.dataset_input_use_parquet and FLAGS.dataset_input_use_tfrecord
+    ), "It's not allowed to specify dataset_input_use_parquet=True and dataset_input_use_tfrecord=True"
     if kwargs.get('kafka_other_metadata',
                   None) is None and FLAGS.kafka_other_metadata is not None:
       kwargs['kafka_other_metadata'] = FLAGS.kafka_other_metadata
     try:
       # the first param is str, batch to streaming, use kafka params for cmd
-      args = [
+      kafka_args = [
           kwargs.pop('topics', FLAGS.kafka_topics.split(',')),
           kwargs.pop('group_id', FLAGS.kafka_group_id),
           kwargs.pop('servers', FLAGS.kafka_servers)
       ]
-      assert all(x is not None for x in args)
+      assert all(x is not None for x in kafka_args)
       logging.info('use KafkaDataset!')
-      return KafkaDataset(*args, **kwargs)
-    except:
+      return KafkaDataset(*kafka_args, **kwargs)
+    except Exception as e:
+      logging.error(str(e))
       logging.info("it's not streaming training")
 
-    if args is None or len(args) == 0:
-      if 'patterns' in kwargs and 'group_id' not in kwargs and 'servers' not in kwargs:
+    tf_record_args = {
+        'file_name', 'compression_type', 'buffer_size', 'num_parallel_reads'
+    }
+
+    def is_kafka_dataset():
+      # 'topics', 'group_id' and 'servers' are for KafkaDataset
+      return 'topics' in kwargs and 'group_id' in kwargs and 'servers' in kwargs
+
+    if args is None or len(args) == 0:  # all arguments are in kwargs
+      # 'patterns' for DistributedFilePBDataset
+      if 'patterns' in kwargs and not is_kafka_dataset():
         logging.info('use DistributedFilePBDataset!')
         return DistributedFilePBDataset(**kwargs)
-      elif 'topics' in kwargs and 'group_id' in kwargs and 'servers' in kwargs:
+      elif is_kafka_dataset():
         logging.info('use KafkaDataset!')
         return KafkaDataset(**kwargs)
       elif kwargs.get('use_parquet'):
         return ParquetDataset(**kwargs)
+      elif kwargs.get('use_tfrecord'):
+        logging.info('use TFRecordDataset!')
+        invalid_args = list(k for k in kwargs if k not in tf_record_args)
+        for k in invalid_args:
+          kwargs.pop(k)
+        logging.info('---kwargs: %s', kwargs)
+        return TFRecordDatasetWrapper(**kwargs)
       elif 'file_name' in kwargs or len(kwargs) == 0:
         return FilePBDataset(*args, **kwargs)
       else:
         return super(DatasetMetaclass, cls).__call__(*args, **kwargs)
-    elif isinstance(args[0], str):
+    elif isinstance(args[0], str):  # The first arg is a filename
       if kwargs.get('use_parquet'):
         return ParquetDataset(*args, **kwargs)
+      elif kwargs.get('use_tfrecord'):
+        logging.info('use TFRecordDataset!')
+        invalid_args = list(k for k in kwargs if k not in tf_record_args)
+        for k in invalid_args:
+          kwargs.pop(k)
+        logging.info('---kwargs: %s', kwargs)
+        return TFRecordDatasetWrapper(*args, **kwargs)
       else:
         logging.info('use FilePBDataset!')
         return FilePBDataset(*args, **kwargs)
-    elif isinstance(args[0], (list, tuple)):
+    elif isinstance(args[0], (list, tuple)):  # The first arg is a list, never reach here
       if len(args) > 1:
         if isinstance(args[1], str):
           logging.info('use KafkaDataset!')
@@ -363,6 +398,20 @@ class DynamicMatchingFilesDataset(dataset_ops.DatasetSource):
     return tensor_spec.TensorSpec([], dtypes.string)
 
 
+class TFRecordDatasetWrapper(tf.data.TFRecordDataset):
+
+  def __init__(self,
+               file_name,
+               compression_type=None,
+               buffer_size=None,
+               num_parallel_reads=None,
+               **kwargs):
+    super().__init__(file_name,
+                     compression_type=compression_type,
+                     buffer_size=buffer_size,
+                     num_parallel_reads=num_parallel_reads)
+
+
 class ParquetDataset(dataset_ops.DatasetSource):
 
   def __init__(self,
@@ -384,12 +433,16 @@ class ParquetDataset(dataset_ops.DatasetSource):
         isinstance(c, str) for c in select_columns)
     assert isinstance(select_columns_type, list) and all(
         t in ["int", "fid_v1", "fid_v2", "float"] for t in select_columns_type)
+    for feature in select_columns:
+      add_feature(feature)
 
     if output_pb_type == PbType.EXAMPLEBATCH and batch_size > 0 and drop_remainder:
       get_default_parser_ctx().set('batch_size', batch_size)
 
     self._out_type = tf.string if output_pb_type == PbType.PLAINTEXT else tf.variant
 
+    tf.compat.v1.add_to_collection(name=OUTPUT_PB_TYPE_GRAPH_KEY,
+                                   value=output_pb_type.to_name())
     variant_tensor = pb_datasource_ops.parquet_dataset(
         file_name=file_name,
         output_pb_type=output_pb_type.to_name(),
@@ -504,6 +557,8 @@ class FilePBDataset(dataset_ops.DatasetSource):
     if use_snappy is None:
       use_snappy = False
 
+    tf.compat.v1.add_to_collection(name=OUTPUT_PB_TYPE_GRAPH_KEY,
+                                   value=output_pb_type.to_name())
     variant_tensor = pb_datasource_ops.pb_dataset(
         file_name=file_name,
         use_snappy=use_snappy,
@@ -543,6 +598,7 @@ class DistributedFilePBDataset(dataset_ops.DatasetSource):
       num_parallel_calls=tf.data.AUTOTUNE,
       deterministic=None,
       use_parquet: bool = False,
+      use_tfrecord: bool = False,
       **kwargs):
     if not patterns:
       patterns = [""]
@@ -558,9 +614,15 @@ class DistributedFilePBDataset(dataset_ops.DatasetSource):
                                                False))
     logging.info(f"enable_dynamic_sharding: {enable_dynamic_sharding}")
 
+    assert not (
+        use_parquet and use_tfrecord
+    ), "It's not allowed to specify use_parquet=True and use_tfrecord=True simultaneously!"
     if use_parquet:
       map_func = lambda file_name: ParquetDataset(
           file_name=file_name, output_pb_type=output_pb_type, **kwargs)
+    elif use_tfrecord:
+      map_func = lambda file_name: tf.data.TFRecordDataset(filenames=
+                                                           [file_name])
     else:
       map_func = lambda file_name: FilePBDataset(
           file_name=file_name,
@@ -719,6 +781,7 @@ class NegativeGenDataset(dataset_ops.UnaryUnchangedStructureDataset):
                throw_origin: bool = False,
                throw_origin_neg: bool = False,
                cache_only_pos: bool = True,
+               cache_negative_actions: List[int] = [],
                real_neg_instance_weight: float = 1.0,
                sampled_neg_instance_weight: float = -1.0,
                unbias_sampled_neg: bool = True,
@@ -737,6 +800,11 @@ class NegativeGenDataset(dataset_ops.UnaryUnchangedStructureDataset):
     assert variant_type in {'instance', 'example'}
     assert label_index >= 0
 
+    assert isinstance(cache_negative_actions, list) and \
+      all(isinstance(x, int) for x in cache_negative_actions)
+    assert len(set(positive_actions) & set(cache_negative_actions)) == 0, \
+      "positive_actions and cache_negative_actions have intersection, pls check"
+
     variant_tensor = pb_datasource_ops.instance_negative_gen_dataset(
         input=input_dataset._variant_tensor,
         pool=pool,
@@ -754,6 +822,7 @@ class NegativeGenDataset(dataset_ops.UnaryUnchangedStructureDataset):
         throw_origin=throw_origin,
         throw_origin_neg=throw_origin_neg,
         cache_only_pos=cache_only_pos,
+        cache_negative_actions=cache_negative_actions,
         real_neg_instance_weight=real_neg_instance_weight,
         sampled_neg_instance_weight=sampled_neg_instance_weight,
         unbias_sampled_neg=unbias_sampled_neg,
@@ -768,10 +837,11 @@ class NegativeGenDataset(dataset_ops.UnaryUnchangedStructureDataset):
     return tensor_spec.TensorSpec([], dtypes.variant)
 
 
-def instance_reweight(self,
-                      action_priority: str,
-                      reweight: str,
-                      variant_type: str = 'example'):
+def instance_reweight(self, action_priority: str, reweight: str, **kwargs):
+  value = tf.compat.v1.get_collection(OUTPUT_PB_TYPE_GRAPH_KEY)
+  assert len(value) == 1
+  variant_type = value[0]
+  assert variant_type in {"instance", "example"}
   return InstanceReweightDataset(self,
                                  action_priority,
                                  reweight,
@@ -869,6 +939,7 @@ class MergeFlowDataset(dataset_ops.DatasetV2):
         'ds_to_merge_{}'.format(i + 1)
         for i in range(len(self._dataset_to_merge))
     ]
+
     variant_tensor = pb_datasource_ops.merge_flow_dataset(
         input_dataset_variant,
         data_flow=data_flow,
@@ -901,13 +972,18 @@ def negative_gen(self,
                  throw_origin: bool = False,
                  throw_origin_neg: bool = False,
                  cache_only_pos: bool = False,
+                 cache_negative_actions: List[int] = [],
                  real_neg_instance_weight: float = 1.0,
                  sampled_neg_instance_weight: float = -1.0,
                  unbias_sampled_neg: bool = True,
                  origin_neg_in_pool_proba: float = 1.0,
                  neg_sample_declay_factor: float = 1.0,
                  easy_hard_ratio: float = 0.0,
-                 variant_type: str = 'example'):
+                 **kwargs):
+  value = tf.compat.v1.get_collection(OUTPUT_PB_TYPE_GRAPH_KEY)
+  assert len(value) == 1
+  variant_type = value[0]
+  assert variant_type in {"instance", "example"}
   return NegativeGenDataset(
       self,
       neg_num=neg_num,
@@ -926,6 +1002,7 @@ def negative_gen(self,
       throw_origin=throw_origin,
       throw_origin_neg=throw_origin_neg,
       cache_only_pos=cache_only_pos,
+      cache_negative_actions=cache_negative_actions,
       real_neg_instance_weight=real_neg_instance_weight,
       sampled_neg_instance_weight=sampled_neg_instance_weight,
       unbias_sampled_neg=unbias_sampled_neg,
@@ -939,7 +1016,11 @@ def split_flow(self,
                data_flow: List[str],
                index: int,
                max_queue_size: int = 1024,
-               variant_type: str = 'example'):
+               **kwargs):
+  value = tf.compat.v1.get_collection(OUTPUT_PB_TYPE_GRAPH_KEY)
+  assert len(value) == 1
+  variant_type = value[0]
+  assert variant_type in {"instance", "example"}
   return SplitFlowDataset(self,
                           data_flow=data_flow,
                           index=index,
@@ -947,10 +1028,11 @@ def split_flow(self,
                           variant_type=variant_type)
 
 
-def merge_flow(self,
-               dataset_to_merge,
-               max_queue_size: int = 1024,
-               variant_type: str = 'example'):
+def merge_flow(self, dataset_to_merge, max_queue_size: int = 1024, **kwargs):
+  value = tf.compat.v1.get_collection(OUTPUT_PB_TYPE_GRAPH_KEY)
+  assert len(value) == 1
+  variant_type = value[0]
+  assert variant_type in {"instance", "example"}
   return MergeFlowDataset(self,
                           dataset_to_merge,
                           max_queue_size=max_queue_size,
@@ -1209,6 +1291,8 @@ class KafkaDataset(dataset_ops.DatasetSource):
         for meta in kafka_other_metadata_list:
           metadata.append(meta)
 
+      tf.compat.v1.add_to_collection(name=OUTPUT_PB_TYPE_GRAPH_KEY,
+                                     value=output_pb_type)
       resource = kafka_resource_init(
           topics=topics,
           metadata=metadata,
@@ -1282,9 +1366,12 @@ def register_dataset(service, dataset, buffer_size=32):
   external_state_policy = dataset.options().experimental_external_state_policy
   if external_state_policy is None:
     external_state_policy = ExternalStatePolicy.WARN
-
-  dataset = dataset.map(lambda *x: compression_ops.compress(x),
-                        num_parallel_calls=dataset_ops.AUTOTUNE)
+  logging.info('external_state_policy: %s', external_state_policy)
+  dataset = dataset.map(
+      lambda *x: compression_ops.compress(x),
+      # num_parallel_calls=dataset_ops.AUTOTUNE)
+      num_parallel_calls=None)
+  logging.info('num_parallel_calls: None')
   # dataset = dataset.prefetch(buffer_size=buffer_size)
   dataset = dataset._apply_options()
 
@@ -1507,9 +1594,49 @@ def distribute(self,
   return dataset
 
 
+def transform(self, t: Transform, **kwargs):
+  value = tf.compat.v1.get_collection(OUTPUT_PB_TYPE_GRAPH_KEY)
+  assert len(value) == 1
+  variant_type = value[0]
+  assert variant_type in {"instance", "example"}
+  return TransformDataset(self, t, variant_type=variant_type)
+
+
+@monolith_export
+class TransformDataset(dataset_ops.UnaryUnchangedStructureDataset):
+  """样本过滤/改写
+
+  Args:
+    input_dataset (:obj:`dataset`): 输入数据集
+    transform (:obj:`Transform`): 改写方式
+    variant_type (:obj:`str`): 输入数据是variant类型的, 支持两种格式, instance/example
+
+  Raises:
+    TypeError: 如果有任何参数与类型不匹配, 则抛TypeError
+    ValueError: 如果有任何值与期望不匹配, 则抛ValueError
+
+  """
+
+  def __init__(self, input_dataset, transform: Transform, variant_type: str):
+    assert variant_type in {"instance", "example"}
+    self._transform = transform
+
+    variant_tensor = pb_datasource_ops.transform_dataset(
+        input=input_dataset._variant_tensor,
+        config=transform.as_proto().SerializeToString(),
+        variant_type=variant_type)
+    logging.info("Start init of the pb instance dataset base.")
+    super(TransformDataset, self).__init__(input_dataset, variant_tensor)
+
+  @property
+  def element_spec(self):
+    return tensor_spec.TensorSpec([], dtypes.variant)
+
+
 Dataset.instance_reweight = instance_reweight
 Dataset.negative_gen = negative_gen
 Dataset.split_flow = split_flow
 Dataset.merge_flow = merge_flow
 Dataset.distribute = lambda ds, *args, **kwargs: ds
 Dataset.merged_window = merged_window
+Dataset.transform = transform

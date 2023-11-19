@@ -93,7 +93,7 @@ from monolith.native_training.hooks import session_hooks
 from monolith.native_training.hooks import feature_engineering_hooks
 from monolith.native_training.hooks.server import server_lib as server_hook_lib
 from monolith.native_training.metric import cli
-from monolith.native_training.metric.metric_hook import Tf2ProfilerHook, Tf2ProfilerCaptureOnceHook, NVProfilerCaptureOnceHook
+from monolith.native_training.metric.metric_hook import Tf2ProfilerHook, NVProfilerHook
 from monolith.native_training.metric.metric_hook import ByteCCLTelemetryHook
 from monolith.native_training.metric.metric_hook import ThroughputMetricHook
 from monolith.native_training.model_export import export_hooks
@@ -101,7 +101,7 @@ from monolith.native_training.model_export import export_utils
 from monolith.native_training.model_export import saved_model_exporters
 from monolith.native_training.model_export import export_context
 from monolith.native_training.model_export.export_context import \
-    is_exporting, is_exporting_distributed, ExportMode
+    is_exporting, is_exporting_distributed, is_dry_run_or_exporting, ExportMode
 from monolith.native_training.native_task import NativeTask
 from monolith.native_training.prefetch_queue import \
     enqueue_dicts_with_queue_return, EnqueueHook
@@ -452,6 +452,7 @@ class CpuTrainingConfig:
     :param items_input_has_sort_id: If items input file has sort_id flag
     :param items_input_kafka_dump: If items input file has kafka_dump flag
     :param items_input_kafka_dump_prefix: If items input file has kafka_dump_prefix flag
+    :param num_extra_dsworker_on_gpu_worker: The number of extra dsworker on GPU worker.
     :param save_summary_steps: Save summaries every this many steps
     :param log_step_count_steps: The frequency, in number of global steps, that the global step and the loss will be logged during training
   """
@@ -488,6 +489,7 @@ class CpuTrainingConfig:
   enable_pipelined_fwda2a: bool = False
   enable_pipelined_bwda2a: bool = False
   profile_some_steps_from: int = None
+  profile_save_steps_interval: int = 5000
   profile_with_nvprof_from_to: str = None
   # Sync training optimization
   reorder_fids_in_data_pipeline: bool = False
@@ -525,6 +527,7 @@ class CpuTrainingConfig:
   items_input_kafka_dump_prefix: bool = False
   device_fn: Callable[[tf.Operation], str] = None
   use_dataservice: bool = None
+  num_extra_dsworker_on_gpu_worker: int = 0
   save_summary_steps: int = 100
   log_step_count_steps: int = 100
 
@@ -558,6 +561,7 @@ def _make_serving_feature_configs_from_training_configs(
     # config: entry.HashTableConfigInstance
     config.table_config.entry_config.entry_type = embedding_hash_table_pb2.EntryConfig.EntryType.SERVING
     config.table_config.skip_zero_embedding = skip_zero_embedding
+    config.table_config.cuckoo.SetInParent()
   return serving_feature_configs
 
 
@@ -574,7 +578,10 @@ def make_native_task_context(config: CpuTrainingConfig,
 
 
 def is_chief(config: CpuTrainingConfig):
-  return config.server_type == "worker" and config.index == 0
+  if config.enable_sync_training or config.enable_partial_sync_training:
+    return config.server_type == "worker" and get_mpi_rank() == 0
+  else:
+    return config.server_type == "worker" and config.index == 0
 
 
 class CpuTraining:
@@ -804,7 +811,7 @@ class CpuTraining:
           if isinstance(ds, tf.data.Dataset):
             if enable_reorder:
               ds = ds.map(reorder_parse_fn, num_parallel_calls=tf.data.AUTOTUNE)
-            if use_dataservice:
+            if use_dataservice and not is_dry_run_or_exporting():
               # This is a temporary hack. Will revisit here once we decided to
               # do the remanagement.
               tmp_mlp_env = mlp_utils.MLPEnv()
@@ -1184,6 +1191,8 @@ class CpuTraining:
       # should_do_first_save = self.config.partial_recovery and ckpt_state is None
       # Here we just make it false because there are issues with uninitialized iterator.
       should_do_first_save = False
+      if self.config.enable_model_dump:
+        save_utils.NoFirstSaveCheckpointSaverHook._in_model_dump_mode = True
       saver_hook = save_utils.NoFirstSaveCheckpointSaverHook(
           model_dir,
           save_secs=save_checkpoints_secs,
@@ -1201,11 +1210,6 @@ class CpuTraining:
           is_dense_only=False,
           use_native_multi_hash_table=self.config.use_native_multi_hash_table,
           no_first_save=not should_do_first_save)
-
-      if self.config.enable_sync_training and self.config.enable_realtime_training:
-        hooks.append(
-            sync_training_hooks.SyncTrainingForceDumpHook(
-                model_dir, saver_hook.timer))
 
       hooks.append(saver_hook)
 
@@ -1275,12 +1279,19 @@ class CpuTraining:
 
     def get_hooks_for_metrics(model_dir: str, save_steps: int):
       hooks = []
-      if self._params.metrics.enable_tf2_profiler_hook:
+      if self._params.metrics.enable_tf2_profiler_hook and is_chief(self.config):
         start_step = self.config.profile_some_steps_from
         end_step = None if start_step is None else start_step + 10
+        save_steps = self.config.profile_save_steps_interval
         hooks.append(
-            Tf2ProfilerCaptureOnceHook(
-                logdir=model_dir, capture_step_range=[start_step, end_step]))
+            Tf2ProfilerHook(
+                logdir=model_dir, init_step_range=[start_step, end_step], save_steps=save_steps))
+
+      if self.config.profile_with_nvprof_from_to and is_chief(self.config):
+        s, e = self.config.profile_with_nvprof_from_to.split(',')
+        save_steps = self.config.profile_save_steps_interval
+        hooks.append(
+            NVProfilerHook(init_step_range=[int(s), int(e)], save_steps=save_steps))
 
       if self._params.metrics.enable_throughput_hook and is_chief(self.config):
         hooks.append(
@@ -1343,6 +1354,14 @@ class CpuTraining:
       async_function_mgr = prefetch_queue.AsyncFunctionMgr(
           is_async=self.config.enable_variable_postpush)
       self._task.ctx.async_function_mgr = async_function_mgr
+      eof_key = sync_training_hooks.EofAwareTask.EOF_KEY
+      if '2' in features:
+        auxiliary_bundle[eof_key] = features.pop('2')
+        logging.info(f'eof: {auxiliary_bundle[eof_key]}, {id(auxiliary_bundle[eof_key])}')
+        features = features.pop('1')
+      elif eof_key in features:
+        auxiliary_bundle[eof_key] = features.pop(eof_key)
+        logging.info(f'eof: {auxiliary_bundle[eof_key]}, {id(auxiliary_bundle[eof_key])}')
 
       def call_raw_model_fn(features):
         raw_model_fn = self._task.create_model_fn()
@@ -1399,6 +1418,9 @@ class CpuTraining:
           auxiliary_bundle[
               "embedding_ragged_ids"] = parser_utils.RaggedEncodingHelper.contract(
                   embedding_ragged_ids)
+          logging.info(
+            f"input: auxiliary_bundle[{auxiliary_bundle}], features:[{features}]"
+          )
           embeddings, auxiliary_bundle = hash_table.lookup(
               name_to_ids, auxiliary_bundle, res_pack)
           dequeued_embeddings = embeddings
@@ -1419,6 +1441,9 @@ class CpuTraining:
           }
           # for MergedMultiTypeHashTable, lookup returns:
           embeddings: Dict[str, tf.Tensor] = hash_table.lookup(name_to_ids)
+          logging.info(
+            f"input: auxiliary_bundle[{auxiliary_bundle}], features:[{features}]"
+          )
           (dequeued_embeddings,
            auxiliary_bundle), q = enqueue_dicts_with_queue_return(
                (embeddings, auxiliary_bundle),
@@ -1601,6 +1626,11 @@ class CpuTraining:
             spec.training_chief_hooks))
         logging.info("Training Hooks: {}".format(spec.training_hooks))
 
+      logging.info(f'dequeue input: auxiliary_bundle[{auxiliary_bundle}], features:[{features}]')
+      dequeued_eof = auxiliary_bundle.pop(eof_key, None)
+      if dequeued_eof is not None:
+        tf.compat.v1.add_to_collection(eof_key, dequeued_eof)
+        logging.info(f'eof dequeue: {dequeued_eof}, {id(dequeued_eof)}')
       return spec
 
     def wrapped_model_fn(features: Dict[str, tf.Tensor], mode: str,
@@ -1765,7 +1795,10 @@ class NodeAliveCheckerError(Exception):
 
 
 def _do_worker_train(config: DistributedCpuTrainingConfig,
-                     params: InstantiableParams, cluster: Dict, task: Dict):
+                     params: InstantiableParams, 
+                     cluster: Dict, 
+                     task: Dict,
+                     user_hooks = None):
   params.mode = config.mode
   native_task = params.instantiate()
   if not isinstance(native_task, NativeTask):
@@ -1805,6 +1838,8 @@ def _do_worker_train(config: DistributedCpuTrainingConfig,
     if is_chief(config):
       _save_debugging_info(config, cluster, training)
     run_hooks = get_sync_run_hooks(False)
+    if user_hooks is not None:
+      run_hooks += user_hooks
     estimator.train(training.create_input_fn(config.mode),
                 hooks=run_hooks,
                 max_steps=params.train.max_steps)
@@ -1822,6 +1857,8 @@ def _do_worker_train(config: DistributedCpuTrainingConfig,
       params.mode = tf.estimator.ModeKeys.PREDICT
       native_task = params.instantiate()
       training = CpuTraining(config, native_task)
+      if config.enable_partial_sync_training or config.use_dataservice:
+        training = sync_training_hooks.EofAwareTask(training, config.use_dataservice)
       estimator = tf.estimator.Estimator(training.create_model_fn(), config=run_config)
       estimator.train(training._task.create_item_input_fn(
           items_path), max_steps=params.train.max_steps)
@@ -1838,7 +1875,7 @@ _EXTRA_PS_BENCHMARK_SECS = 120
 
 
 def _run_ps_benchmark(config: DistributedCpuTrainingConfig,
-                      num_ps_required: int, cluster: dict, task: dict):
+                      num_ps_required: int, cluster: dict, task: dict, user_hooks):
   config = copy.deepcopy(config)
   cluster = copy.deepcopy(cluster)
   bm_params = ps_benchmark.PsBenchMarkTask.params()
@@ -1854,7 +1891,7 @@ def _run_ps_benchmark(config: DistributedCpuTrainingConfig,
   config.operation_timeout_in_ms = int(_EXTRA_PS_BENCHMARK_SECS * 1000 +
                                        30 * 1000)
   logging.info("Run PS benchmark")
-  _do_worker_train(config, bm_params, cluster, task)
+  _do_worker_train(config, bm_params, cluster, task, user_hooks)
   cluster["ps"] = ps_list
   return cluster
 
@@ -1958,7 +1995,8 @@ def make_config_backward_compatible(model_dir: str, config: CpuTrainingConfig):
 def distributed_train(config: DistributedCpuTrainingConfig,
                       discovery: ServiceDiscovery,
                       params: InstantiableParams,
-                      sync_backend: SyncBackend = None):
+                      sync_backend: SyncBackend = None,
+                      user_hooks = None):
   """Trains the server in a distributed fashion."""
   if config.index is None:
     raise ValueError("Index can't be none.")
@@ -2037,7 +2075,8 @@ def distributed_train(config: DistributedCpuTrainingConfig,
         config.containers_ready_time_secs = int(time.time())
       if config.num_extra_ps:
         filtered_cluster = _run_ps_benchmark(config, config.num_ps,
-                                             filtered_cluster, task)
+                                             filtered_cluster, task, 
+                                             user_hooks)
       return filtered_cluster, task
 
     cluster, task = _get_cluster_and_task()
@@ -2059,7 +2098,7 @@ def distributed_train(config: DistributedCpuTrainingConfig,
             if config.enable_gpu_training:
               device_utils.enable_gpu_training()
               params.train.use_gpu_emb_table = False
-            estimator = _do_worker_train(config, params, cluster, task)
+            estimator = _do_worker_train(config, params, cluster, task, user_hooks)
           break
         except (tf.errors.DeadlineExceededError, tf.errors.UnavailableError,
                 NodeAliveCheckerError) as e:
@@ -2120,7 +2159,8 @@ def distributed_train(config: DistributedCpuTrainingConfig,
 
 def distributed_sync_train(config: DistributedCpuTrainingConfig,
                            params: InstantiableParams,
-                           sync_backend: SyncBackend = None):
+                           sync_backend: SyncBackend = None,
+                           user_hooks = None):
   """
   This is the entry point for synchronous distributed training.
   This system allows the model to train in a half sync manner as well, when set
@@ -2193,36 +2233,13 @@ def distributed_sync_train(config: DistributedCpuTrainingConfig,
                                      config=run_config)
   run_hooks = get_sync_run_hooks(True)
 
-  # When we use distributed training, we always use rank 1 to profile
-  # because rank 0 might not get embedding shard due to partition logic
-  # for np >= 4.
-  if get_mpi_size() == 1 or get_mpi_rank() == 1:
-    tf.profiler.experimental.server.start(6666)
-    if config.profile_some_steps_from:
-      start_step = config.profile_some_steps_from
-      end_step = start_step + 10
-      options = tf.profiler.experimental.ProfilerOptions(
-          host_tracer_level=int(os.getenv('MONOLITH_TRACE_LEVEL', '3')),
-          python_tracer_level=1,
-          # CUPTI_ERROR_MULTIPLE_SUBSCRIBERS_NOT_SUPPORTED:
-          # CUPTI doesn't allow multiple callback subscribers.
-          # Only a single subscriber can be registered at a time.
-          device_tracer_level=0 if config.profile_with_nvprof_from_to else 1)
-      prof_hook = Tf2ProfilerCaptureOnceHook(
-          logdir=config.tensorboard_log_path or config.model_dir,
-          capture_step_range=(start_step, end_step),
-          options=options)
-      run_hooks.append(prof_hook)
-
-    if config.profile_with_nvprof_from_to:
-      s, e = config.profile_with_nvprof_from_to.split(',')
-      run_hooks.append(
-          NVProfilerCaptureOnceHook(capture_step_range=[int(s), int(e)]))
-
   if sync_backend is not None:
     run_hooks.append(
         sync_training_hooks.ParameterSyncHook(sync_backend, config.index))
   run_hooks.append(sync_training_hooks.SyncTrainingInfoHook())
+
+  if user_hooks is not None:
+    run_hooks += user_hooks
 
   estimator.train(training.create_input_fn(config.mode),
                   hooks=run_hooks,
@@ -2236,7 +2253,8 @@ def local_train_internal(params: InstantiableParams,
                          conf: CpuTrainingConfig,
                          model_dir: str,
                          steps: int = 100,
-                         profiling: bool = False) -> tf.estimator.Estimator:
+                         profiling: bool = False,
+                         user_hooks = None) -> tf.estimator.Estimator:
   """Do a local training. Especially useful in the local demo."""
   if tf.compat.v1.executing_eagerly():
     raise EnvironmentError(
@@ -2288,6 +2306,7 @@ def local_train_internal(params: InstantiableParams,
                                   log_step_count_steps=conf.log_step_count_steps)
   estimator = tf.estimator.Estimator(training.create_model_fn(), config=config)
   estimator.train(training.create_input_fn(tf.estimator.ModeKeys.TRAIN),
+                  hooks=user_hooks,
                   steps=steps)
 
   if conf.enable_resource_constrained_roughsort and conf.mode == tf.estimator.ModeKeys.TRAIN:

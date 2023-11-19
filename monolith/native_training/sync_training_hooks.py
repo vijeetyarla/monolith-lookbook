@@ -269,6 +269,7 @@ class EofAwareTask:
   def __init__(self, task: native_task.NativeTask, use_dataservice: bool = False):
     self._ori_task = task
     self.use_dataservice = use_dataservice
+    logging.info(f'init EofAwareTask')
 
   def create_input_fn(self, mode):
 
@@ -278,6 +279,9 @@ class EofAwareTask:
 
       def new_input_fn():
         ds = input_fn()
+        if export_context.is_dry_run_or_exporting():
+          return ds
+
         ds = datasets.CacheOneDataset(ds)
 
         # There are 2 reasons why we need a map here:
@@ -286,7 +290,7 @@ class EofAwareTask:
         # the original data after we wrap the input_fn output.
         def map_fn(features, eof):
           if isinstance(features, dict):
-            logging.info(EofAwareTask.EOF_KEY)
+            logging.info(f"in map_fn: {EofAwareTask.EOF_KEY}")
             return {**features, EofAwareTask.EOF_KEY: eof}
           logging.info('map_fn keys: 1, 2')
           return {"1": features, "2": eof}
@@ -305,22 +309,22 @@ class EofAwareTask:
     model_fn = self._ori_task.create_model_fn()
 
     def new_model_fn_factory(model_fn):
-      if export_context.is_exporting():
+      if export_context.is_dry_run_or_exporting():
         return model_fn
 
       def new_model_fn(features, mode, config):
-        if EofAwareTask.EOF_KEY in features:
-          eof = features[EofAwareTask.EOF_KEY]
-          features.pop(EofAwareTask.EOF_KEY)
-          real_features = features
+        spec: tf.estimator.EstimatorSpec = model_fn(features, mode, config)
+        dequeued_eof = tf.compat.v1.get_collection(EofAwareTask.EOF_KEY)
+        if dequeued_eof and not export_context.is_dry_run_or_exporting():
+          if isinstance(dequeued_eof, (list, tuple)):
+            dequeued_eof = dequeued_eof[0]
+          assert(isinstance(dequeued_eof, tf.Tensor))
+          training_hooks = spec.training_hooks or ()
+          training_hooks = [self.EofHook(dequeued_eof)] + list(training_hooks)
+          spec = spec._replace(training_hooks=training_hooks)
+          return spec
         else:
-          real_features, eof = features["1"], features["2"]
-        spec: tf.estimator.EstimatorSpec = model_fn(real_features, mode, config)
-        training_hooks = spec.training_hooks or ()
-        training_hooks = list(training_hooks)
-        training_hooks.append(self.EofHook(eof))
-        spec = spec._replace(training_hooks=training_hooks)
-        return spec
+          return spec
 
       return new_model_fn
 
@@ -349,4 +353,3 @@ class EofAwareTask:
         logging.info(f'rank {hvd_lib.rank()} request_stop, results is {run_values.results}, before')
         run_context.request_stop()
         logging.info(f'rank {hvd_lib.rank()} request_stop, results is {run_values.results}, after')
-
